@@ -1,0 +1,385 @@
+#!/bin/sh
+
+#     2021 IOS project 1
+#     Stock market log analyzer
+#     author: MARKO KUBRACHENKO
+#     login: xkubra00
+
+export POSIXLY_CORRECT=yes
+export LC_NUMERIC=en_US.UTF-8
+
+print_help() {
+  echo "Usage: tradelog [-h|--help]"
+  echo "       tradelog [FILTER] [COMMAND] [LOG [LOG2 [...]]"
+  echo ""
+  echo "FILTER:"
+  echo "   -a DATETIME      Only records after this date are considered (without this date)"
+  echo "   -b DATETIME      Only records BEFORE this date (without this date) are considered"
+  echo "                    DATETIME is in the format YYYY-MM-DD HH:MM:SS"
+  echo "   -t TICKER        Only entries corresponding to a given ticker are considered"
+  echo "   -w WIDTH         Sets graph width (the length of the longest line) to WIDTH"
+  echo "   -h or --help     Prints help with a brief description of each command and switch"
+  echo "COMMAND:"
+  echo "   list-tick        Prints a list of occurring stock exchange symbols, so-called \"ticker\""
+  echo "   profit           Prints a statement of total profit from closed positions"
+  echo "   pos              Prints a list of values of currently held positions sorted in descending order by value"
+  echo "   last-price       Prints the last known price for each ticker"
+  echo "   hist-ord         Histogram report of the number of transactions according to the ticker"
+  echo "   graph-pos        Prints a statement of graph of values of held positions according to the ticker"
+}
+
+# time variables if user will not use filter
+AFTERTIME="0000-00-00 00:00:00"
+BEFORETIME="9999-99-99 99:99:99"
+
+# reading arguments
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+  -h | --help)
+    print_help
+    exit 0
+    ;;
+
+  list-tick | profit | pos | last-price | hist-ord | graph-pos)
+    if [ -z "$COMMAND" ]; then
+      COMMAND="$1"
+    else
+      echo "You can only use ONE command at a time"
+      exit 1
+    fi
+    shift
+    ;;
+
+  -a)
+    AFTERTIME="$2"
+    shift
+    shift
+    ;;
+
+  -b)
+    BEFORETIME="$2"
+    shift
+    shift
+    ;;
+
+  -w)
+    if [ "$2" -le "0" ]; then
+      echo "Width must be positive number and more than 0"
+      exit 1
+    elif [ -n "$WIDTH" ]; then
+      echo "You have already entered WIDTH"
+      exit 1
+    else
+      WIDTH="$2"
+    fi
+    shift
+    shift
+    ;;
+
+  -t)
+    TICKERS="$2|$TICKERS"
+    shift
+    shift
+    ;;
+
+  *.gz)
+    if [ -f "$1" ]; then
+      GZ_LOG="$1"
+      VALUE="$VALUE$( gzip -c -d "$GZ_LOG" )
+"
+    else
+      echo "There is no $1 in this directory"
+      ls
+      exit 1
+    fi
+    shift
+    ;;
+
+  *.log)
+    if [ -f "$1" ]; then
+      LOG="$1"
+      VALUE="$VALUE$( cat "$LOG" )
+"
+    else
+      echo "There is no $1 in this directory"
+      ls
+      exit 1
+    fi
+    shift
+    ;;
+
+  *)
+    print_help
+    exit 1
+    ;;
+  esac
+done
+
+# reading from stdin if file was not given
+if [ -z "$VALUE" ]; then
+  VALUE="$( while IFS= read -r line; do
+    echo "$line"
+  done )"
+fi
+
+# unique sort and delete empty lines
+VALUE="$( echo "$VALUE" | sort -u | awk '!/^$/' )"
+
+# ticker filter
+FILTERED_VALUE="$( echo "$VALUE" | while IFS= read -r line; do
+  if [ -n "$TICKERS" ]; then
+    echo "$line" | awk -F ";" -v var="$TICKERS" '
+    {
+      n = split ( var, tickers, "|" )
+      for ( i = 1; i <= n; i++ )
+        if ( $2 == tickers[i] )
+          print $0
+    }'
+  else
+    echo "$line"
+  fi
+done )"
+
+# time filter
+FILTERED_VALUE="$( echo "$FILTERED_VALUE" | awk -F ";" -v time="$AFTERTIME" '
+{
+  if ( $1 > time )
+    print $0
+}' )"
+
+FILTERED_VALUE="$( echo "$FILTERED_VALUE" | awk -F ";" -v time="$BEFORETIME" '
+{
+  if ( $1 < time )
+    print $0
+}' )"
+
+# output when no argument was specified
+if [ -z "$COMMAND" ]; then
+  echo "$FILTERED_VALUE"
+fi
+
+# unique sorted tickers
+LIST_TICKERS="$( echo "$FILTERED_VALUE" | cut -d ";" -f 2 | sort -u )"
+SORTED_TICKERS="$( echo "$LIST_TICKERS" | tr '\n' '|' )"
+
+# list_tick command
+if echo "$COMMAND" | grep -q "list-tick"; then
+  echo "$LIST_TICKERS"
+fi
+
+# profit command
+if echo "$COMMAND" | grep -q "profit"; then
+  echo "$FILTERED_VALUE" | awk -F ";" '
+  {
+    if ( $3 == "sell" )
+      value = +( $4 * $6 )
+    else
+      value = -( $4 * $6 )
+    printf "%.2f\n", value
+
+  }' | awk '{ profit+=$1 } END { printf "%.2f\n", profit }'
+fi
+
+# pos and graph-pos commands
+if echo "$COMMAND" | grep -q "^pos\|^graph-pos"; then
+  SIZE="$( echo "$SORTED_TICKERS" | awk -F "|" '{ print NF-1 }' )"
+  HOLD="$( echo "$FILTERED_VALUE" | awk -F ";" -v var="$SORTED_TICKERS" '
+  {
+    n = split ( var, tickers, "|" )
+    for ( i = 1; i < n; i++ )
+    {
+      if ( $2 == tickers[i] )
+      {
+        if ( $3 == "sell" )
+          hold[i] -= $6
+        else
+          hold[i] += $6
+      }
+      print hold[i]
+    }
+  }' | tail -n "$SIZE" | tr '\n' '|' )"
+
+  PRICE="$( echo "$FILTERED_VALUE" | awk -F ";" -v var="$SORTED_TICKERS" '
+  {
+    n = split ( var, tickers, "|" )
+    for ( i = 1; i < n; i++ )
+    {
+      if ( $2 == tickers[i] )
+      {
+        price[i] = $4
+      }
+      print price[i]
+    }
+  }' | tail -n "$SIZE" | tr '\n' '|' )"
+
+  VALUES="$( echo "$VALUES" | awk -v var1="$HOLD" -v var2="$PRICE" '
+  {
+    n = split ( var1, holds, "|" )
+    split ( var2, prices, "|" )
+
+    for ( i = 1; i < n; i++ )
+    {
+      values[i] = holds[i] * prices[i]
+      printf "%.2f\n", values[i]
+    }
+  }' | tr '\n' '|' )"
+
+  # pos output
+  if echo "$COMMAND" | grep -q "^pos"; then
+    echo "$POS" | awk -v var1="$SORTED_TICKERS" -v var2="$VALUES" '
+    {
+      n = split ( var1, tickers, "|" )
+      split ( var2, values, "|" )
+
+      for ( i = 1; i < n; i++ )
+        if ( m < length( values[i] ) )
+          m=length( values[i] )
+
+      for ( i = 1; i < n; i++ )
+        printf "%-10s:%*.2f\n", tickers[i], m + 1, values[i]
+    }' | sort -t ":" -k2 -rn
+
+  # graph-pos output
+  else
+    if [ -z "$WIDTH" ]; then
+      WIDTH="1000"
+    fi
+
+    VALUES="$( echo "$POS" | awk -v var1="$SORTED_TICKERS" -v var2="$VALUES" -v var3="$WIDTH" '
+    {
+      n = split ( var1, tickers, "|" )
+      split ( var2, values, "|" )
+
+      for ( i = 1; i < n; i++ )
+      {
+        if ( values[i] >= 0 )
+          number = values[i]
+        if ( values[i] < 0 )
+          number = - values[i]
+        if ( m < number )
+          m = number
+      }
+      w = m / var3
+      for ( i = 1; i < n; i++)
+      {
+        values[i] = int( values[i] / w )
+        if ( values[i] >= 0 )
+        {
+          for ( j = 0; j < values[i]; j++ )
+          {
+            printf "#"
+          }
+          printf "\n"
+        }
+        else
+        {
+          for ( j = 0; j > values[i]; j-- )
+          {
+            printf "!"
+          }
+          printf "\n"
+        }
+      }
+    }' | tr '\n' '|' )"
+
+    echo "$GRAPH" | awk -v var1="$SORTED_TICKERS" -v var2="$VALUES" '
+    {
+      n = split ( var1, tickers, "|" )
+      split ( var2, values, "|" )
+      for ( i = 1; i < n; i++ )
+      {
+        if ( values[i] == "" )
+          printf "%-10s:\n", tickers[i]
+        else
+          printf "%-10s: %s\n", tickers[i], values[i]
+      }
+    }'
+  fi
+fi
+
+# last-price command
+if echo "$COMMAND" | grep -q "last-price"; then
+  echo "$FILTERED_VALUE" | awk -F ";" -v var="$SORTED_TICKERS" '
+  {
+    n = split ( var, tickers, "|" )
+    for ( i = 1; i < n; i++ )
+    {
+      if ( $2 == tickers[i] )
+        prices[i] = $4
+      if ( m < length( prices[i] ) )
+        m = length( prices[i] )
+    }
+  }
+  END {
+    for ( i = 1; i < n; i++ )
+      printf "%-10s:%*.2f\n", tickers[i], m + 1, prices[i]
+  }'
+fi
+
+# hist-ord command
+if echo "$COMMAND" | grep -q "hist-ord"; then
+  VALUES="$( echo "$FILTERED_VALUE" | awk -F ";" -v var="$SORTED_TICKERS" '
+  {
+    n = split ( var, tickers, "|" )
+    for ( i = 1; i < n; i++ )
+    {
+      if ( $2 == tickers[i] )
+        count[i] += 1
+      if ( m < count[i] )
+        m = count[i]
+    }
+  }
+  END {
+    for ( i = 1; i < n; i++ )
+      print count[i]
+  }' | tr '\n' '|' )"
+
+  # if width filter was specified
+  if [ -n "$WIDTH" ]; then
+    VALUES="$( echo "$VALUES" | awk -v var1="$VALUES" -v var2="$WIDTH" '
+    {
+      n = split ( var1, count, "|" )
+      for ( i = 1; i < n; i++ )
+      {
+        if ( m < count[i] )
+          m = count[i]
+      }
+      w = m / var2
+      for ( i = 1; i < n; i++ )
+      {
+        count[i] = int ( count[i] / w )
+        for ( j = 0; j < count[i]; j++ )
+        {
+          printf "#"
+        }
+        printf "\n"
+      }
+    }' | tr '\n' '|' )"
+  else
+    VALUES="$( echo "$VALUES" | awk -v var="$VALUES" '
+    {
+      n = split ( var, count, "|" )
+      for ( i = 1; i < n; i++ )
+      {
+        for ( j = 0; j < count[i]; j++ )
+        {
+          printf "#"
+        }
+        printf "\n"
+      }
+    }' | tr '\n' '|' )"
+  fi
+
+  echo "$HIST" | awk -v var1="$SORTED_TICKERS" -v var2="$VALUES" '
+  {
+    n = split ( var1, tickers, "|" )
+    split ( var2, values, "|" )
+    for ( i = 1; i < n; i++ )
+    {
+      if ( values[i] == "" )
+        printf "%-10s:\n", tickers[i]
+      else
+        printf "%-10s: %s\n", tickers[i], values[i]
+    }
+  }'
+fi
